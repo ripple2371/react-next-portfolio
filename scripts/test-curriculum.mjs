@@ -70,6 +70,61 @@ for (const [file, endpoint, listFn, detailFn, sampleName] of [
     const mod = load(`curriculum/steps/10-${file}.ts.txt`, imports({ getListDetail: async () => { throw error; }, getList: async () => { throw error; } }));
     await assert.rejects(mod[detailFn]('missing'), e => e.message === error.message);
   });
+  await test(`${endpoint}:実SDKのリクエストとエラー伝播`, async () => {
+    const originalFetch = globalThis.fetch;
+    const slug = 'cms test';
+    const base = `https://mock.microcms.io/api/v1/${endpoint}`;
+    const requests = [];
+    const responses = [];
+    globalThis.fetch = async (url, init) => {
+      requests.push(String(url));
+      assert.equal(init.cache, 'no-store');
+      const response = responses.shift();
+      if (response instanceof Error) throw response;
+      return response;
+    };
+    try {
+      const cms = load('lib/microcms.ts', {}, {
+        MICROCMS_SERVICE_DOMAIN: 'mock',
+        MICROCMS_API_KEY: 'test-only',
+      });
+      const mod = load(`lib/${file}.ts`, {
+        '@/lib/microcms': cms,
+        '@/lib/cms-errors': errors,
+      });
+      responses.push(Response.json({ contents: [item] }), Response.json(item));
+      assert.equal((await mod[listFn]())[0].slug, item.id);
+      assert.equal((await mod[detailFn](slug)).slug, item.id);
+      assert.equal(new URL(requests[0]).pathname, `/api/v1/${endpoint}`);
+      assert.equal(new URL(requests[0]).searchParams.get('limit'), '100');
+      assert.equal(requests[1], `${base}/cms%20test`);
+
+      responses.push(new Response(null, { status: 404 }), Response.json({ contents: [] }));
+      assert.equal(await mod[detailFn]('missing'), undefined);
+      assert.equal(requests.at(-1), `${base}?limit=0`);
+
+      responses.push(new Response(null, { status: 404 }), new Response(null, { status: 404 }));
+      await assert.rejects(mod[detailFn]('missing'), /404/);
+
+      for (const status of [401, 403, 500]) {
+        for (const fetchContent of [mod[listFn], () => mod[detailFn](slug)]) {
+          responses.push(new Response(null, { status }));
+          const requestCount = requests.length;
+          await assert.rejects(fetchContent(), new RegExp(String(status)));
+          assert.equal(requests.length, requestCount + 1);
+        }
+      }
+
+      for (const fetchContent of [mod[listFn], () => mod[detailFn](slug)]) {
+        responses.push(new TypeError('mock network failure'));
+        const requestCount = requests.length;
+        await assert.rejects(fetchContent());
+        assert.equal(requests.length, requestCount + 1);
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
   for (const status of [401, 403, 500]) {
     await test(`${endpoint}:HTTP ${status}を404にしない`, async () => {
       const mod = load(`curriculum/steps/10-${file}.ts.txt`, imports({ getListDetail: async () => { throw new Error(`fetch API response status: ${status}`); } }));
